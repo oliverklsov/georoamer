@@ -93,20 +93,34 @@ function seededRandom(seed, i) {
   return x - Math.floor(x);
 }
 
-function getDailyLocationIds(date) {
-  const seed = parseInt(date.replace(/-/g, ''), 10);
+function getLocationIdsForSeed(seed, exclude) {
   const ids = [];
   const used = new Set();
   let i = 0;
   while (ids.length < 5) {
     const idx = Math.floor(seededRandom(seed, i) * LOCATIONS.length);
-    if (!used.has(idx)) {
+    const id = LOCATIONS[idx].id;
+    if (!used.has(idx) && !exclude.has(id)) {
       used.add(idx);
-      ids.push(LOCATIONS[idx].id);
+      ids.push(id);
     }
     i++;
+    if (i > LOCATIONS.length * 10) break;
   }
   return ids;
+}
+
+function getDailyLocationIds(date) {
+  const seed = parseInt(date.replace(/-/g, ''), 10);
+  const recentlyUsed = new Set();
+  for (let d = 1; d <= 6; d++) {
+    const pastDate = new Date(date);
+    pastDate.setDate(pastDate.getDate() - d);
+    const pastDateStr = pastDate.toISOString().slice(0, 10);
+    const pastSeed = parseInt(pastDateStr.replace(/-/g, ''), 10);
+    getLocationIdsForSeed(pastSeed, new Set()).forEach(id => recentlyUsed.add(id));
+  }
+  return getLocationIdsForSeed(seed, recentlyUsed);
 }
 
 function haversineDistance(lat1, lon1, lat2, lon2) {
@@ -244,6 +258,24 @@ const COUNTRY_QID = {
   'Australia': 'Q408', 'New Zealand': 'Q664', 'Costa Rica': 'Q800',
   'Cuba': 'Q241', 'Dominican Republic': 'Q786', 'Panama': 'Q804',
   'Belarus': 'Q184',
+  'Uruguay': 'Q77', 'Bolivia': 'Q750', 'Paraguay': 'Q733',
+  'Estonia': 'Q191', 'Latvia': 'Q211', 'Lithuania': 'Q37',
+  'Slovakia': 'Q214', 'Romania': 'Q218', 'Ukraine': 'Q212',
+  'Bosnia': 'Q225', 'Albania': 'Q222', 'Malta': 'Q233',
+  'Cyprus': 'Q229', 'North Macedonia': 'Q221', 'Moldova': 'Q217',
+  'Luxembourg': 'Q32', 'Ethiopia': 'Q115', 'Tanzania': 'Q924',
+  'Uganda': 'Q1036', 'Tunisia': 'Q948', 'Rwanda': 'Q1037',
+  'Mozambique': 'Q1029', 'Zambia': 'Q953', 'Zimbabwe': 'Q954',
+  'Angola': 'Q916', 'Pakistan': 'Q843', 'Nepal': 'Q837',
+  'Myanmar': 'Q836', 'Cambodia': 'Q424', 'Mongolia': 'Q711',
+  'Georgia': 'Q230', 'Armenia': 'Q399', 'Azerbaijan': 'Q227',
+  'Lebanon': 'Q822', 'Jordan': 'Q810', 'Iran': 'Q794',
+  'Taiwan': 'Q865', 'Oman': 'Q842', 'Qatar': 'Q846',
+  'Kuwait': 'Q817', 'Turkmenistan': 'Q874', 'Kyrgyzstan': 'Q813',
+  'Tajikistan': 'Q863', 'Afghanistan': 'Q889', 'Fiji': 'Q712',
+  'Papua New Guinea': 'Q691', 'Jamaica': 'Q766', 'Haiti': 'Q790',
+  'Honduras': 'Q783', 'Guatemala': 'Q774', 'Nicaragua': 'Q811',
+  'El Salvador': 'Q792',
 };
 
 const DECADES = [1960, 1970, 1980, 1990, 2000, 2010];
