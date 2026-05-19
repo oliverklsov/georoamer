@@ -2,19 +2,63 @@ import { useState, useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api, loadUser } from '../api';
 
+const SHARE_TIERS = [
+  { min: 4500, emoji: '🟩' },
+  { min: 3500, emoji: '🟨' },
+  { min: 2000, emoji: '🟧' },
+  { min: 500,  emoji: '🟥' },
+  { min: 0,    emoji: '⬜' },
+];
+
+function scoreEmoji(score) {
+  return SHARE_TIERS.find(t => score >= t.min).emoji;
+}
+
+function buildShareText({ date, rounds, totalScore, streak }) {
+  const grid = rounds
+    .slice()
+    .sort((a, b) => a.roundNumber - b.roundNumber)
+    .map(r => scoreEmoji(r.roundScore ?? 0))
+    .join('');
+  const streakLine = streak > 1 ? ` · 🔥 ${streak}-day streak` : '';
+  return `GeoRoamer ${date}\n${grid}\n${totalScore.toLocaleString()} pts${streakLine}`;
+}
+
 export default function Results() {
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const [leaderboard, setLeaderboard] = useState([]);
+  const [me, setMe] = useState(null);
+  const [copied, setCopied] = useState(false);
   const user = loadUser();
   const alreadyPlayed = params.get('played') === 'true';
 
   useEffect(() => {
     if (!user) { navigate('/'); return; }
     api.getLeaderboard().then(setLeaderboard).catch(() => {});
+    api.me().then(setMe).catch(() => {});
   }, [navigate, user]);
 
   const myEntry = leaderboard.find(r => r.username === user?.username);
+  const canShare = me?.today?.completed && me.today.rounds?.length > 0;
+
+  async function handleShare() {
+    if (!canShare) return;
+    const text = buildShareText({
+      date: me.today.date,
+      rounds: me.today.rounds,
+      totalScore: me.today.totalScore,
+      streak: me.streak,
+    });
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Fallback: select-and-prompt if clipboard API unavailable
+      window.prompt('Copy your result:', text);
+    }
+  }
 
   return (
     <div style={styles.root}>
@@ -29,6 +73,37 @@ export default function Results() {
             <div style={styles.scoreLabel}>your score · rank #{myEntry.rank}</div>
           </div>
         )}
+
+        {me && me.streak > 0 && (
+          <div style={styles.streak}>
+            <span style={styles.streakFlame}>🔥</span>
+            <span style={styles.streakNum}>{me.streak}</span>
+            <span style={styles.streakLabel}>day streak</span>
+          </div>
+        )}
+
+        {canShare && (
+          <>
+            <div style={styles.gridPreview}>
+              {me.today.rounds
+                .slice()
+                .sort((a, b) => a.roundNumber - b.roundNumber)
+                .map(r => (
+                  <span key={r.roundNumber} style={styles.gridCell}>
+                    {scoreEmoji(r.roundScore ?? 0)}
+                  </span>
+                ))}
+            </div>
+            <button
+              className="btn-primary"
+              style={{ width: '100%', padding: 14, marginBottom: 12 }}
+              onClick={handleShare}
+            >
+              {copied ? '✓ Copied to clipboard!' : '📋 Share result'}
+            </button>
+          </>
+        )}
+
         <p style={styles.comeback}>Come back tomorrow for a new set of locations.</p>
         <button className="btn-secondary" style={{ width: '100%', padding: 14 }} onClick={() => navigate('/')}>
           Back to Home
@@ -84,10 +159,32 @@ const styles = {
   },
   icon: { fontSize: 56, marginBottom: 16 },
   title: { fontSize: 26, fontWeight: 800, marginBottom: 24 },
-  myScore: { marginBottom: 24 },
+  myScore: { marginBottom: 16 },
   scoreBig: { fontSize: 64, fontWeight: 900, color: 'var(--primary)', lineHeight: 1 },
   scoreLabel: { fontSize: 14, color: 'var(--muted)', marginTop: 4 },
-  comeback: { color: 'var(--muted)', fontSize: 14, marginBottom: 24 },
+  streak: {
+    display: 'inline-flex',
+    alignItems: 'baseline',
+    gap: 6,
+    padding: '8px 14px',
+    marginBottom: 20,
+    background: 'var(--surface2)',
+    border: '1px solid var(--border)',
+    borderRadius: 999,
+  },
+  streakFlame: { fontSize: 18 },
+  streakNum: { fontSize: 20, fontWeight: 800, color: 'var(--primary)' },
+  streakLabel: { fontSize: 13, color: 'var(--muted)' },
+  gridPreview: {
+    display: 'flex',
+    justifyContent: 'center',
+    gap: 4,
+    fontSize: 28,
+    marginBottom: 12,
+    letterSpacing: 2,
+  },
+  gridCell: { lineHeight: 1 },
+  comeback: { color: 'var(--muted)', fontSize: 14, marginBottom: 24, marginTop: 8 },
   lbWrap: { width: 300 },
   lbTitle: { fontSize: 16, fontWeight: 700, color: 'var(--muted)', marginBottom: 12 },
   lbList: {

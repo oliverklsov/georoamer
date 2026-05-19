@@ -40,6 +40,9 @@ export const api = {
     const q = date ? `?date=${date}` : '';
     return request('GET', `/leaderboard${q}`);
   },
+  me() {
+    return request('GET', '/me');
+  },
 };
 
 export function saveUser(userId, username, token) {

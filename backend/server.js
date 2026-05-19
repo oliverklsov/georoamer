@@ -34,9 +34,11 @@ db.exec(`
   );
 
   CREATE TABLE IF NOT EXISTS location_images (
-    location_id INTEGER PRIMARY KEY,
-    image_id    TEXT NOT NULL,
-    cached_at   TEXT DEFAULT (datetime('now'))
+    location_id   INTEGER PRIMARY KEY,
+    image_id      TEXT NOT NULL,
+    is_pano       INTEGER,
+    quality_score REAL,
+    cached_at     TEXT DEFAULT (datetime('now'))
   );
 
   CREATE TABLE IF NOT EXISTS game_sessions (
@@ -139,58 +141,79 @@ function scoreFromMiles(distanceMiles) {
   return Math.max(0, Math.round(5000 * Math.exp(-km / 1500)));
 }
 
+// Score a Mapillary candidate. Higher = better.
+// Panos are dramatically better for guessing (player can look around).
+// quality_score is Mapillary's own 0–1 estimate; recency favors modern cameras.
+function rankMapillaryCandidate(c) {
+  let score = 0;
+  if (c.is_pano) score += 100;
+  if (typeof c.quality_score === 'number') score += c.quality_score * 50;
+  if (c.captured_at) {
+    const ageYears = (Date.now() - new Date(c.captured_at).getTime()) / (365.25 * 24 * 3600 * 1000);
+    if (ageYears < 5) score += 10;
+    else if (ageYears < 10) score += 5;
+  }
+  return score;
+}
+
+async function fetchMapillaryCandidates(lat, lng, radius) {
+  const url =
+    `https://graph.mapillary.com/images?fields=id,is_pano,quality_score,captured_at` +
+    `&lat=${lat}&lng=${lng}&radius=${radius}&limit=30&access_token=${MAPILLARY_TOKEN}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  return data.data ?? [];
+}
+
 async function fetchImageId(locationId) {
+  // is_pano column on cache row means a row was created by the new (ranked) algorithm.
+  // Legacy rows (is_pano IS NULL) get refreshed once.
   const cached = db
-    .prepare('SELECT image_id FROM location_images WHERE location_id = ?')
+    .prepare('SELECT image_id, is_pano FROM location_images WHERE location_id = ?')
     .get(locationId);
-  if (cached) return cached.image_id;
+  if (cached && cached.is_pano !== null) return cached.image_id;
 
   const loc = LOCATIONS.find(l => l.id === locationId);
-  if (!loc || !MAPILLARY_TOKEN) return null;
+  if (!loc || !MAPILLARY_TOKEN) return cached?.image_id ?? null;
 
-  // Primary: lat/lng/radius search (works reliably for dense cities where bbox hits rate errors)
-  try {
-    const url =
-      `https://graph.mapillary.com/images?fields=id` +
-      `&lat=${loc.lat}&lng=${loc.lng}&radius=50&limit=1&access_token=${MAPILLARY_TOKEN}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    if (data.data?.length > 0) {
-      const imageId = data.data[0].id;
-      db.prepare('INSERT OR REPLACE INTO location_images (location_id, image_id) VALUES (?, ?)')
-        .run(locationId, imageId);
-      return imageId;
-    }
-  } catch (err) {
-    console.error('Mapillary radius fetch error:', err.message);
-  }
-
-  // Fallback: bbox with small deltas
-  for (const delta of [0.003, 0.006, 0.012]) {
+  // Widen the search until we find candidates; pick the best by rank.
+  let best = null;
+  let bestScore = -Infinity;
+  for (const radius of [100, 250, 500]) {
     try {
-      const bbox = `${loc.lng - delta},${loc.lat - delta},${loc.lng + delta},${loc.lat + delta}`;
-      const url =
-        `https://graph.mapillary.com/images?fields=id` +
-        `&bbox=${bbox}&limit=1&access_token=${MAPILLARY_TOKEN}`;
-      const res = await fetch(url);
-      const data = await res.json();
-      if (data.data?.length > 0) {
-        const imageId = data.data[0].id;
-        db.prepare('INSERT OR REPLACE INTO location_images (location_id, image_id) VALUES (?, ?)')
-          .run(locationId, imageId);
-        return imageId;
+      const candidates = await fetchMapillaryCandidates(loc.lat, loc.lng, radius);
+      for (const c of candidates) {
+        const s = rankMapillaryCandidate(c);
+        if (s > bestScore) { bestScore = s; best = c; }
       }
+      if (best) break;
     } catch (err) {
-      console.error('Mapillary bbox fetch error:', err.message);
+      console.error(`Mapillary fetch error (r=${radius}):`, err.message);
     }
   }
-  return null;
+
+  if (!best) return cached?.image_id ?? null;
+
+  db.prepare(
+    'INSERT OR REPLACE INTO location_images (location_id, image_id, is_pano, quality_score, cached_at) VALUES (?, ?, ?, ?, datetime(\'now\'))'
+  ).run(locationId, best.id, best.is_pano ? 1 : 0, best.quality_score ?? null);
+  return best.id;
 }
 
 // Migrate existing DB — add pin_hash if it doesn't exist yet
 const cols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);
 if (!cols.includes('pin_hash')) {
   db.prepare("ALTER TABLE users ADD COLUMN pin_hash TEXT").run();
+}
+
+// Migrate location_images: add quality columns so we can distinguish legacy
+// (random-first-hit) rows from new ranked picks and refresh them once.
+const imgCols = db.prepare("PRAGMA table_info(location_images)").all().map(c => c.name);
+if (!imgCols.includes('is_pano')) {
+  db.prepare("ALTER TABLE location_images ADD COLUMN is_pano INTEGER").run();
+}
+if (!imgCols.includes('quality_score')) {
+  db.prepare("ALTER TABLE location_images ADD COLUMN quality_score REAL").run();
 }
 
 function createPinHash(pin) {
@@ -558,6 +581,49 @@ app.post('/api/reveal-round', requireAuth, (req, res) => {
     actualCountry: location.country,
     gameComplete,
   });
+});
+
+// Current user: streak + today's per-round scores (for share grid)
+app.get('/api/me', requireAuth, (req, res) => {
+  const today = new Date().toISOString().slice(0, 10);
+
+  const completedDates = new Set(
+    db.prepare('SELECT date FROM game_sessions WHERE user_id = ? AND completed = 1')
+      .all(req.user.id)
+      .map(r => r.date)
+  );
+
+  // Walk back from today (or yesterday if today not yet played) counting consecutive completed days.
+  let streak = 0;
+  const cursor = new Date(today);
+  if (!completedDates.has(today)) cursor.setUTCDate(cursor.getUTCDate() - 1);
+  while (completedDates.has(cursor.toISOString().slice(0, 10))) {
+    streak++;
+    cursor.setUTCDate(cursor.getUTCDate() - 1);
+  }
+
+  const session = db
+    .prepare('SELECT * FROM game_sessions WHERE user_id = ? AND date = ?')
+    .get(req.user.id, today);
+
+  let todayInfo = null;
+  if (session) {
+    const rounds = db
+      .prepare('SELECT round_number, round_score, completed FROM round_results WHERE session_id = ? ORDER BY round_number')
+      .all(session.id);
+    todayInfo = {
+      date: today,
+      completed: session.completed === 1,
+      totalScore: session.total_score,
+      rounds: rounds.map(r => ({
+        roundNumber: r.round_number,
+        roundScore: r.round_score,
+        completed: r.completed === 1,
+      })),
+    };
+  }
+
+  res.json({ streak, today: todayInfo });
 });
 
 // Daily leaderboard

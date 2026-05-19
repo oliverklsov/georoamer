@@ -17,7 +17,7 @@ export default function StreetView({ imageId }) {
         accessToken: MAPILLARY_TOKEN,
         container: containerRef.current,
         imageId,
-        component: { cover: false, sequence: false },
+        component: { cover: false },
       });
       viewerRef.current = viewer;
     });
