@@ -14,6 +14,11 @@ RUN npm install --prefix backend && npm install --prefix frontend
 
 COPY . .
 
+ARG VITE_MAPILLARY_TOKEN
+ARG VITE_ADSENSE_CLIENT
+ENV VITE_MAPILLARY_TOKEN=$VITE_MAPILLARY_TOKEN
+ENV VITE_ADSENSE_CLIENT=$VITE_ADSENSE_CLIENT
+
 RUN npm run build --prefix frontend
 
 ENV PORT=8080
