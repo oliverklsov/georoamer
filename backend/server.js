@@ -177,9 +177,12 @@ async function fetchImageId(locationId) {
   if (!loc || !MAPILLARY_TOKEN) return cached?.image_id ?? null;
 
   // Widen the search until we find candidates; pick the best by rank.
+  // Final radii are large because for a country-level guessing game a
+  // shot a few km from the iconic spot is still useful, and some Wikipedia
+  // coordinates land in spots Mapillary just hasn't been driven through.
   let best = null;
   let bestScore = -Infinity;
-  for (const radius of [100, 250, 500]) {
+  for (const radius of [100, 250, 500, 1000, 2500, 5000]) {
     try {
       const candidates = await fetchMapillaryCandidates(loc.lat, loc.lng, radius);
       for (const c of candidates) {
@@ -310,18 +313,11 @@ function wikimediaThumbnail(fullUrl, width = 160) {
   return `https://commons.wikimedia.org/w/index.php?title=Special:Redirect/file/${match[1]}&width=${width}`;
 }
 
-async function fetchMovieForLocation(locationId, dateSeed) {
-  const loc = LOCATIONS.find(l => l.id === locationId);
-  const qid = loc ? COUNTRY_QID[loc.country] : null;
-  if (!qid) return null;
-
-  const decadeIdx = Math.floor(seededRandom(dateSeed, locationId + 500) * DECADES.length);
-  const decade = DECADES[decadeIdx];
-
-  const cached = db.prepare('SELECT * FROM movie_cache WHERE location_id = ? AND decade = ?').get(locationId, decade);
-  if (cached) return { title: cached.title, year: cached.year, posterUrl: cached.poster_url, decade };
-
-  const sparql = `
+function buildMovieSparql(qid, decade, requirePoster) {
+  const posterClause = requirePoster
+    ? '?film wdt:P18 ?poster .'
+    : 'OPTIONAL { ?film wdt:P18 ?poster }';
+  return `
     SELECT ?film ?filmLabel ?year ?poster WHERE {
       VALUES ?type { wd:Q11424 wd:Q24869 wd:Q1261214 }
       ?film wdt:P31 ?type ;
@@ -330,13 +326,15 @@ async function fetchMovieForLocation(locationId, dateSeed) {
             wikibase:sitelinks ?sitelinks .
       BIND(YEAR(?date) AS ?year)
       FILTER(?year >= ${decade} && ?year <= ${decade + 9})
-      OPTIONAL { ?film wdt:P18 ?poster }
+      ${posterClause}
       SERVICE wikibase:label { bd:serviceParam wikibase:language "en" }
     }
     ORDER BY DESC(?sitelinks)
     LIMIT 1
   `;
+}
 
+async function runMovieSparql(sparql) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12000);
   try {
@@ -345,24 +343,49 @@ async function fetchMovieForLocation(locationId, dateSeed) {
       { headers: { 'User-Agent': 'GeoRoamer/1.0 (educational geography game)' }, signal: controller.signal }
     );
     const data = await res.json();
-    const row = data.results?.bindings?.[0];
-    if (!row) return null;
-
-    const title = row.filmLabel?.value ?? null;
-    const year = parseInt(row.year?.value) || null;
-    const posterUrl = wikimediaThumbnail(row.poster?.value ?? null);
-
-    if (title && year) {
-      db.prepare('INSERT OR REPLACE INTO movie_cache (location_id, decade, title, year, poster_url) VALUES (?, ?, ?, ?, ?)')
-        .run(locationId, decade, title, year, posterUrl);
-    }
-    return title && year ? { title, year, posterUrl, decade } : null;
+    return data.results?.bindings?.[0] ?? null;
   } catch (err) {
     if (err.name !== 'AbortError') console.error('Wikidata error:', err.message);
     return null;
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function fetchMovieForLocation(locationId, dateSeed) {
+  const loc = LOCATIONS.find(l => l.id === locationId);
+  const qid = loc ? COUNTRY_QID[loc.country] : null;
+  if (!qid) return null;
+
+  const decadeIdx = Math.floor(seededRandom(dateSeed, locationId + 500) * DECADES.length);
+  const decade = DECADES[decadeIdx];
+
+  // Reuse cache only when it has a poster — refresh poster-less rows once so
+  // we get a chance to grab one with the new poster-required first pass.
+  const cached = db.prepare('SELECT * FROM movie_cache WHERE location_id = ? AND decade = ?').get(locationId, decade);
+  if (cached && cached.poster_url) {
+    return { title: cached.title, year: cached.year, posterUrl: cached.poster_url, decade };
+  }
+
+  // First pass: require a poster. Falls back to films without if the
+  // country/decade has none on Wikidata (rare but happens for small markets).
+  let row = await runMovieSparql(buildMovieSparql(qid, decade, true));
+  if (!row) row = await runMovieSparql(buildMovieSparql(qid, decade, false));
+  if (!row) {
+    // Keep the (titled) cached row if we had one, even without a poster.
+    if (cached) return { title: cached.title, year: cached.year, posterUrl: null, decade };
+    return null;
+  }
+
+  const title = row.filmLabel?.value ?? null;
+  const year = parseInt(row.year?.value) || null;
+  const posterUrl = wikimediaThumbnail(row.poster?.value ?? null);
+
+  if (title && year) {
+    db.prepare('INSERT OR REPLACE INTO movie_cache (location_id, decade, title, year, poster_url) VALUES (?, ?, ?, ?, ?)')
+      .run(locationId, decade, title, year, posterUrl);
+  }
+  return title && year ? { title, year, posterUrl, decade } : null;
 }
 
 function requireAuth(req, res, next) {
