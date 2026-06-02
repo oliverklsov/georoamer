@@ -156,12 +156,26 @@ function rankMapillaryCandidate(c) {
   return score;
 }
 
-async function fetchMapillaryCandidates(lat, lng, radius) {
-  const url =
-    `https://graph.mapillary.com/images?fields=id,is_pano,quality_score,captured_at` +
-    `&lat=${lat}&lng=${lng}&radius=${radius}&limit=30&access_token=${MAPILLARY_TOKEN}`;
+// Mapillary's `radius` param is capped at 50 meters server-side; anything
+// larger returns an API error. For wider searches we use a square `bbox`
+// centered on the location instead. Limit is small because dense downtown
+// areas (Ottawa, NYC, etc.) trigger a "reduce the amount of data" cap if
+// we ask for too many rows at once. We also surface `data.error` so a
+// future regression can't silently become "no candidates."
+async function fetchMapillaryCandidates(lat, lng, params) {
+  let url = `https://graph.mapillary.com/images?fields=id,is_pano,quality_score,captured_at&limit=10&access_token=${MAPILLARY_TOKEN}`;
+  if (params.radius != null) {
+    url += `&lat=${lat}&lng=${lng}&radius=${params.radius}`;
+  } else {
+    const d = params.bboxDelta;
+    url += `&bbox=${lng - d},${lat - d},${lng + d},${lat + d}`;
+  }
   const res = await fetch(url);
   const data = await res.json();
+  if (data.error) {
+    console.warn(`Mapillary API error (${JSON.stringify(params)}): ${data.error.message}`);
+    return [];
+  }
   return data.data ?? [];
 }
 
@@ -176,30 +190,36 @@ async function fetchImageId(locationId) {
   const loc = LOCATIONS.find(l => l.id === locationId);
   if (!loc || !MAPILLARY_TOKEN) return cached?.image_id ?? null;
 
-  // Widen the search until we find candidates; pick the best by rank.
-  // Final radii are large because for a country-level guessing game a
-  // shot tens of km from the iconic spot is still useful, and some Wikipedia
-  // coordinates land in spots Mapillary just hasn't been driven through.
+  // Widen progressively until we find candidates. Start with the tightest
+  // (50m radius, anchored to the location) then expand to a bbox sweep —
+  // 0.001°/0.005°/0.025°/0.1°/0.5° latitude ≈ 110m / 550m / 2.8km / 11km / 55km.
+  // First two are the sweet spot for downtown landmarks; the wider passes
+  // exist for rural locations where the closest road is several km away.
   let best = null;
   let bestScore = -Infinity;
-  for (const radius of [100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000]) {
+  const passes = [
+    { radius: 50 },
+    { bboxDelta: 0.001 },
+    { bboxDelta: 0.005 },
+    { bboxDelta: 0.025 },
+    { bboxDelta: 0.1 },
+    { bboxDelta: 0.5 },
+  ];
+  for (const params of passes) {
     try {
-      const candidates = await fetchMapillaryCandidates(loc.lat, loc.lng, radius);
+      const candidates = await fetchMapillaryCandidates(loc.lat, loc.lng, params);
       for (const c of candidates) {
         const s = rankMapillaryCandidate(c);
         if (s > bestScore) { bestScore = s; best = c; }
       }
       if (best) break;
     } catch (err) {
-      console.error(`Mapillary fetch error (r=${radius}):`, err.message);
+      console.error(`Mapillary fetch error (${JSON.stringify(params)}):`, err.message);
     }
   }
 
   if (!best) {
-    // Surface this in Fly logs so we can identify the locations that have
-    // genuine zero coverage at 50km and either move their coords or drop
-    // them from rotation.
-    console.warn(`Mapillary: no candidates within 50km for location ${locationId} (${loc.city}, ${loc.country})`);
+    console.warn(`Mapillary: no candidates within ~55km for location ${locationId} (${loc.city}, ${loc.country})`);
     return cached?.image_id ?? null;
   }
 
