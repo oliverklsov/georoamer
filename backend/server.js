@@ -178,11 +178,11 @@ async function fetchImageId(locationId) {
 
   // Widen the search until we find candidates; pick the best by rank.
   // Final radii are large because for a country-level guessing game a
-  // shot a few km from the iconic spot is still useful, and some Wikipedia
+  // shot tens of km from the iconic spot is still useful, and some Wikipedia
   // coordinates land in spots Mapillary just hasn't been driven through.
   let best = null;
   let bestScore = -Infinity;
-  for (const radius of [100, 250, 500, 1000, 2500, 5000]) {
+  for (const radius of [100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000]) {
     try {
       const candidates = await fetchMapillaryCandidates(loc.lat, loc.lng, radius);
       for (const c of candidates) {
@@ -195,7 +195,13 @@ async function fetchImageId(locationId) {
     }
   }
 
-  if (!best) return cached?.image_id ?? null;
+  if (!best) {
+    // Surface this in Fly logs so we can identify the locations that have
+    // genuine zero coverage at 50km and either move their coords or drop
+    // them from rotation.
+    console.warn(`Mapillary: no candidates within 50km for location ${locationId} (${loc.city}, ${loc.country})`);
+    return cached?.image_id ?? null;
+  }
 
   db.prepare(
     'INSERT OR REPLACE INTO location_images (location_id, image_id, is_pano, quality_score, cached_at) VALUES (?, ?, ?, ?, datetime(\'now\'))'
@@ -334,7 +340,14 @@ function buildMovieSparql(qid, decade, requirePoster) {
   `;
 }
 
+// Wikidata aggressively rate-limits cloud-provider IPs (Fly is hit hard).
+// When throttled it serves an HTML error page. We short-circuit further calls
+// for a cooldown window instead of burning every request on a guaranteed-bad
+// response — the cache is the steady-state path anyway.
+let wikidataCooldownUntil = 0;
+
 async function runMovieSparql(sparql) {
+  if (Date.now() < wikidataCooldownUntil) return null;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 12000);
   try {
@@ -342,6 +355,12 @@ async function runMovieSparql(sparql) {
       `https://query.wikidata.org/sparql?format=json&query=${encodeURIComponent(sparql)}`,
       { headers: { 'User-Agent': 'GeoRoamer/1.0 (educational geography game)' }, signal: controller.signal }
     );
+    const contentType = res.headers.get('content-type') ?? '';
+    if (!res.ok || !contentType.includes('json')) {
+      wikidataCooldownUntil = Date.now() + 15 * 60 * 1000;
+      console.warn(`Wikidata throttled or errored (status=${res.status}, ct=${contentType}). Cooling down 15 min.`);
+      return null;
+    }
     const data = await res.json();
     return data.results?.bindings?.[0] ?? null;
   } catch (err) {
